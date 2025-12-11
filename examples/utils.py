@@ -112,7 +112,8 @@ def get_args(
             # Based on this fix: https://github.com/huggingface/diffusers/pull/12563
             "native",  # native pytorch attention: sdpa
             "_native_cudnn",
-            "_native_npu"
+            "_native_npu",
+            "_mindie_sd_la"
         ],
     )
     parser.add_argument("--perf", action="store_true", default=False)

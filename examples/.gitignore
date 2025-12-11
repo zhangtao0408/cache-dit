@@ -167,3 +167,4 @@ report*.html
 *.png
 *.mp4
 tmp*
+*result*

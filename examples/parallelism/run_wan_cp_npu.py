@@ -8,6 +8,7 @@ import time
 import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
+import torch.distributed as dist
 
 from diffusers import WanPipeline, WanTransformer3DModel
 from diffusers.utils import export_to_video
@@ -23,14 +24,44 @@ import cache_dit
 from cache_dit.npu_optim import npu_optimize
 
 
-def run_pipe(args, pipe, warmup: bool = False):
+def init_profiler(step=1):
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+    	export_type=torch_npu.profiler.ExportType.Text,
+    	profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+    	msprof_tx=False,
+    	aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+    	l2_cache=False,
+    	op_attr=False,
+    	data_simplification=False,
+    	record_op_args=False,
+    	gc_detect_threshold=None
+    )
+
+    prof = torch_npu.profiler.profile(
+    	activities=[
+    		torch_npu.profiler.ProfilerActivity.CPU,
+    		torch_npu.profiler.ProfilerActivity.NPU
+    		],
+    	schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=step, repeat=1, skip_first=0),
+    	on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result"),
+    	record_shapes=True,
+    	profile_memory=False,
+    	with_stack=False,
+    	with_modules=False,
+    	with_flops=False,
+    	experimental_config=experimental_config)
+    return prof
+
+
+def run_pipe(args, pipe, warmup: bool = False, prof=None):
     prompt = "A cat walks on the grass, realistic"
-    negative_prompt = "Bright tones, overexposed, static, blurred details, "
-    "subtitles, style, works, paintings, images, static, overall gray, "
-    "worst quality, low quality, JPEG compression residue, ugly, incomplete, "
-    "extra fingers, poorly drawn hands, poorly drawn faces, deformed, "
-    "disfigured, misshapen limbs, fused fingers, still picture, messy "
-    "background, three legs, many people in the background, walking backwards"
+    negative_prompt = \
+        "Bright tones, overexposed, static, blurred details, " \
+        "subtitles, style, works, paintings, images, static, overall gray, " \
+        "worst quality, low quality, JPEG compression residue, ugly, incomplete, " \
+        "extra fingers, poorly drawn hands, poorly drawn faces, deformed, " \
+        "disfigured, misshapen limbs, fused fingers, still picture, messy " \
+        "background, three legs, many people in the background, walking backwards"
 
     seed = 1234
     generator = torch.Generator(device="cpu").manual_seed(seed)
@@ -45,6 +76,7 @@ def run_pipe(args, pipe, warmup: bool = False):
         guidance_scale=5.0,
         generator=generator,
         num_inference_steps=num_inference_steps,
+        prof=prof,
     ).frames[0]
     return output
 
@@ -54,6 +86,7 @@ def main():
     print(args)
 
     rank, device = maybe_init_distributed(args)
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
 
     model_id = os.environ.get(
         "WAN_2_2_DIR",
@@ -75,7 +108,13 @@ def main():
         pipe.to(device)
 
     if args.vae_dp:
-        pipe.vae.enable_dp(world_size=8, hw_splits=(2, 4)) # , overlap_ratio=0.01, overlap_pixels=64)
+        HW_SPLITS = {
+            1: (1, 1),
+            2: (1, 2),
+            4: (2, 2),
+            8: (2, 4),
+        }
+        pipe.vae.enable_dp(world_size=world_size, hw_splits=HW_SPLITS[world_size]) # , overlap_ratio=0.01, overlap_pixels=64)
 
     if args.vae_tiling:
         pipe.vae.enable_tiling(
@@ -91,9 +130,14 @@ def main():
 
     # warmup
     _ = run_pipe(args, pipe, warmup=True)
+    
+    prof = None
+    # prof = True
+    if prof:
+        prof = init_profiler(args.steps + 2)
 
     start = time.time()
-    video = run_pipe(args, pipe)
+    video = run_pipe(args, pipe, prof=prof)
     end = time.time()
 
     if rank == 0:
